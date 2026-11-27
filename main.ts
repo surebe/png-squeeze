@@ -309,7 +309,7 @@ function samplesOf(rgba: Uint8Array, ct: number): Uint8Array {
   return out;
 }
 
-function paletteForm(rgba: Uint8Array, colours: { rgba: number[]; word: number; count: number }[], order: string): Form {
+function paletteForm(rgba: Uint8Array, colours: { rgba: number[]; word: number; count: number }[], order: string, base?: Form & { indexByWord: Map<number, number> }): Form & { indexByWord: Map<number, number> } {
   const lum = (c: { rgba: number[] }) => 299 * c.rgba[0] + 587 * c.rgba[1] + 114 * c.rgba[2];
   const entries = order === 'scan' ? [...colours] : [...colours].sort((x, y) => {
     if (order !== 'plain') {
@@ -321,7 +321,7 @@ function paletteForm(rgba: Uint8Array, colours: { rgba: number[]; word: number; 
     if (order === 'count') return y.count - x.count || x.word - y.word;
     return lum(x) - lum(y) || x.word - y.word;
   });
-  const index = new Map(entries.map((c, i) => [c.word, i]));
+  const index: Map<number, number> = base !== undefined ? base.indexByWord : new Map(entries.map((c, i) => [c.word, i]));
   const plte = new Uint8Array(entries.length * 3);
   let transparent = 0;
   entries.forEach((c, i) => {
@@ -332,9 +332,30 @@ function paletteForm(rgba: Uint8Array, colours: { rgba: number[]; word: number; 
   });
   const trns = transparent === 0 ? null : Uint8Array.from(entries.slice(0, transparent), (c) => c.rgba[3]);
   const n = rgba.length >>> 2;
-  const u32 = new Uint32Array(rgba.buffer, rgba.byteOffset, n);
   const indices = new Uint8Array(n);
-  for (let i = 0; i < n; i++) indices[i] = index.get(u32[i]) as number;
+  if (base !== undefined) {
+    // Same colours, new order: remap the base form's indices through the
+    // permutation instead of walking a Map over every pixel again.
+    const perm = new Uint8Array(entries.length);
+    entries.forEach((c, i) => {
+      perm[base.indexByWord.get(c.word) as number] = i;
+    });
+    const from = base.samples;
+    for (let i = 0; i < n; i++) indices[i] = perm[from[i]];
+  } else {
+    const u32 = new Uint32Array(rgba.buffer, rgba.byteOffset, n);
+    const own = new Map(entries.map((c, i) => [c.word, i]));
+    for (let i = 0; i < n; i++) indices[i] = own.get(u32[i]) as number;
+    return {
+      colourType: 3,
+      bpp: 1,
+      samples: indices,
+      plte,
+      trns,
+      chunkBytes: 12 + plte.length + (trns === null ? 0 : 12 + trns.length),
+      indexByWord: own,
+    };
+  }
   return {
     colourType: 3,
     bpp: 1,
@@ -342,6 +363,7 @@ function paletteForm(rgba: Uint8Array, colours: { rgba: number[]; word: number; 
     plte,
     trns,
     chunkBytes: 12 + plte.length + (trns === null ? 0 : 12 + trns.length),
+    indexByWord: index,
   };
 }
 
@@ -349,10 +371,11 @@ function formsOf(rgba: Uint8Array): Form[] {
   const { opaque, grey, colours } = analyse(rgba);
   const forms: Form[] = [];
   if (colours !== null) {
-    forms.push(paletteForm(rgba, colours, 'count'));
-    forms.push(paletteForm(rgba, colours, 'luminance'));
-    forms.push(paletteForm(rgba, colours, 'plain'));
-    forms.push(paletteForm(rgba, colours, 'scan'));
+    const base = paletteForm(rgba, colours, 'count');
+    forms.push(base);
+    forms.push(paletteForm(rgba, colours, 'luminance', base));
+    forms.push(paletteForm(rgba, colours, 'plain', base));
+    forms.push(paletteForm(rgba, colours, 'scan', base));
     if (!grey) return forms;
   }
   const key = opaque ? null : transparentKey(rgba, grey);
@@ -561,7 +584,10 @@ function findMatches(data: Uint8Array, chainCap?: number): MatchSet {
       const d = i - p;
       if (d > 32768) break;
       // A candidate only matters if it can beat the best length so far: test the byte at bestLen first.
-      if (bestLen < maxLen && data[p + bestLen] === data[i + bestLen]) {
+      if (bestLen < maxLen && data[p + bestLen] === data[i + bestLen] &&
+          data[p + 2] === data[i + 2] &&
+          (bestLen < 4 || data[p + (bestLen >> 1)] === data[i + (bestLen >> 1)]) &&
+          (bestLen < 2 || data[p + bestLen - 1] === data[i + bestLen - 1])) {
         let l = 0;
         while (l < maxLen && data[p + l] === data[i + l]) l++;
         if (l >= 3) {
@@ -1057,22 +1083,32 @@ function writeSymbols(
   w.writeCode(lit.rev[256], litLen[256]);
 }
 
-/** The best DEFLATE (as a zlib stream) we can make of `data`: optimal parse + block-split choice, vs zlib level 9. */
-function deflateBest(data: Uint8Array, light = false): Uint8Array {
+/** The best DEFLATE (as a zlib stream) we can make of `data`: optimal parse + block-split choice, vs zlib level 9.
+ *  deepCap: run the match search once at this chain depth instead of the default
+ *  (deep chains are where flat/repetitive streams hide their best matches).
+ *  pre: a match set + greedy parse computed by the caller, reused as-is.
+ *  abortAboveBits: abandon the parse at once when its first plan is worse
+ *  than this (a rival stream's finished size, with margin).
+ *  cheapRaw: a cheap raw DEFLATE of the same data (the screening stream).
+ *  It stands in for the zlib-9 fallback, which is only computed when the
+ *  parse actually looks beatable — level 9 on megabytes is slow, and with
+ *  deep match search the parse almost always wins. */
+function deflateBest(data: Uint8Array, light = false, deepCap = 0, pre?: { ms: MatchSet; parse: Parse }, abortAboveBits = Infinity, cheapRaw?: Uint8Array): Uint8Array {
   // Release the DP scratch up front so its peak does not stack with the
   // match tables being built below; dpParse regrows it on demand.
   dpScratch.cost = new Float64Array(0);
   dpScratch.chLen = new Int32Array(0);
   dpScratch.chDist = new Int32Array(0);
-  const fallback = new Uint8Array(deflateRawSync(data, { level: 9 }));
-  let best = zlibWrap(fallback, data);
+  let best: Uint8Array = cheapRaw !== undefined ? zlibWrap(cheapRaw, data) : zlibWrap(new Uint8Array(deflateRawSync(data, { level: 9 })), data);
+  let bestIsCheap = cheapRaw !== undefined;
+  const zlib9 = (): Uint8Array => zlibWrap(new Uint8Array(deflateRawSync(data, { level: 9 })), data);
   try {
-    let ms = findMatches(data);
-    let parse = greedyParse(data, ms);
+    let ms = pre !== undefined ? pre.ms : findMatches(data, deepCap > 0 ? deepCap : undefined);
+    let parse = pre !== undefined ? pre.parse : greedyParse(data, ms);
     let litLen = new Uint8Array(288);
     let distLen = new Uint8Array(32);
     let prevBits = Infinity;
-    const maxIter = light ? 3 : data.length > 2_000_000 ? 3 : 4;
+    const maxIter = light ? 4 : data.length > 2_000_000 ? 3 : 5;
     for (let iter = 0; iter < maxIter; iter++) {
       const freq = parseFreqs(parse);
       litLen = huffmanLengths(freq.lit, 15);
@@ -1088,11 +1124,18 @@ function deflateBest(data: Uint8Array, light = false): Uint8Array {
       }
       parse = dpParse(data, ms, litCost, lenCost, distCost);
       if (iter === 0) {
-        // If the optimal path is already clearly worse than the zlib stream,
-        // stop spending time on it (the fallback is returned below anyway) —
-        // unless this stream qualifies for the deep-chain rescue pass.
-        const deepCandidate = data.length >= 1_500_000 && data.length <= 3_000_000;
-        if (!deepCandidate && planBlock(parse, 0, parse.count).bits > (best.length - 6) * 8 * 1.03) return best;
+        const plan0 = planBlock(parse, 0, parse.count).bits;
+        // A rival stream already finished smaller (with margin): abandon.
+        if (plan0 > abortAboveBits) return best;
+        // If the optimal path looks clearly worse than even the cheap
+        // stream, check it against the real zlib-9 before giving up on it.
+        if (plan0 > (best.length - 6) * 8 * 1.03) {
+          if (!bestIsCheap) return best;
+          const real = zlib9();
+          if (plan0 > (real.length - 6) * 8 * 1.03) return real;
+          best = real;
+          bestIsCheap = false;
+        }
       }
       if (iter >= 1) {
         const bits = planBlock(parse, 0, parse.count).bits;
@@ -1100,32 +1143,10 @@ function deflateBest(data: Uint8Array, light = false): Uint8Array {
         prevBits = bits;
       }
     }
-    // Repetitive streams (long average matches) hide their best matches deep
-    // in the hash chains: re-search with a much deeper chain and refine.
-    if (!light && data.length >= 1_500_000 && data.length <= 3_000_000 && data.length / parse.count >= 40) {
-      const before = planBlock(parse, 0, parse.count).bits;
-      const oldParse = parse;
-      ms = findMatches(data, 1024);
-      for (let iter = 0; iter < 1; iter++) {
-        const freq = parseFreqs(parse);
-        litLen = huffmanLengths(freq.lit, 15);
-        distLen = huffmanLengths(freq.dist, 15);
-        const litCost = new Float64Array(288);
-        for (let s = 0; s < 288; s++) litCost[s] = litLen[s] === 0 ? 24 : litLen[s];
-        const lenCost = new Float64Array(259);
-        for (let l = 3; l <= 258; l++) lenCost[l] = litCost[257 + LEN_CODE[l]] + LEN_COST_EXTRA[l];
-        const distCost = new Float64Array(32769);
-        for (let d = 1; d <= 32768; d++) {
-          const dl = distLen[DIST_CODE[d]];
-          distCost[d] = (dl === 0 ? 24 : dl) + DIST_COST_EXTRA[d];
-        }
-        parse = dpParse(data, ms, litCost, lenCost, distCost);
-      }
-      if (planBlock(parse, 0, parse.count).bits >= before) parse = oldParse;
-    }
     // Choose a block segmentation by total planned bits.
     const n = data.length;
     let bestSeg: number[] = [0, parse.count];
+    let bestPlans: BlockPlan[] = [planBlock(parse, 0, parse.count)];
     let bestBits = Infinity;
     for (const segs of [1, 2, 3, 4, 6, 8, 12]) {
       const bounds: number[] = [0];
@@ -1143,21 +1164,31 @@ function deflateBest(data: Uint8Array, light = false): Uint8Array {
       }
       bounds.push(parse.count);
       let bits = 0;
-      for (let b = 0; b + 1 < bounds.length; b++) bits += planBlock(parse, bounds[b], bounds[b + 1]).bits;
+      const plans: BlockPlan[] = [];
+      for (let b = 0; b + 1 < bounds.length; b++) {
+        const p = planBlock(parse, bounds[b], bounds[b + 1]);
+        plans.push(p);
+        bits += p.bits;
+      }
       if (bits < bestBits) {
         bestBits = bits;
         bestSeg = bounds;
+        bestPlans = plans;
       }
     }
     const w = new BitWriter();
     for (let b = 0; b + 1 < bestSeg.length; b++) {
-      const plan = planBlock(parse, bestSeg[b], bestSeg[b + 1]);
-      encodeBlock(w, parse, bestSeg[b], bestSeg[b + 1], b + 2 === bestSeg.length, plan);
+      encodeBlock(w, parse, bestSeg[b], bestSeg[b + 1], b + 2 === bestSeg.length, bestPlans[b]);
     }
     const ours = zlibWrap(w.finish(), data);
     if (ours.length < best.length) best = ours;
+    else if (bestIsCheap) {
+      // The parse did not beat even the cheap stream: the real fallback decides.
+      const real = zlib9();
+      if (real.length < best.length) best = real;
+    }
   } catch {
-    // Any failure in the optimal path leaves the zlib stream, which is always valid.
+    // Any failure in the optimal path leaves the fallback stream, which is always valid.
   }
   return best;
 }
@@ -1184,9 +1215,21 @@ function costTables(parse: Parse): { litCost: Float64Array; lenCost: Float64Arra
  * from a cheap single-candidate hash matcher (most recent occurrence only).
  * Only used to rank filter candidates, so a rough LZ-aware figure suffices.
  */
+const rscHead = new Int32Array(1 << 15).fill(-1);
+const rscEpoch = new Int32Array(1 << 15);
+let rscTick = 0;
 function rowStreamCost(buf: Uint8Array, rowStart: number, t: { litCost: Float64Array; lenCost: Float64Array; distCost: Float64Array }): number {
   const n = buf.length;
-  const head = new Int32Array(1 << 15).fill(-1);
+  // Epoch-stamped view of the shared table: entries from earlier calls are
+  // invisible, so the table never needs clearing (it was re-filled per call).
+  const tick = ++rscTick;
+  const head = {
+    get: (h: number): number => (rscEpoch[h] === tick ? rscHead[h] : -1),
+    set: (h: number, v: number): void => {
+      rscEpoch[h] = tick;
+      rscHead[h] = v;
+    },
+  };
   const hashAt = (p: number): number => (((buf[p] << 16) ^ (buf[p + 1] << 8) ^ buf[p + 2]) * 2654435761 >>> 17) & 0x7fff;
   let cost = 0;
   let i = 0;
@@ -1195,8 +1238,8 @@ function rowStreamCost(buf: Uint8Array, rowStart: number, t: { litCost: Float64A
     let bestDist = 0;
     if (i + 2 < n) {
       const h = hashAt(i);
-      const cand = head[h];
-      head[h] = i;
+      const cand = head.get(h);
+      head.set(h, i);
       if (cand >= 0 && i - cand <= 32768) {
         let l = 0;
         const maxL = Math.min(258, n - i);
@@ -1209,7 +1252,7 @@ function rowStreamCost(buf: Uint8Array, rowStart: number, t: { litCost: Float64A
     }
     if (bestLen >= 3) {
       if (i >= rowStart) cost += t.lenCost[bestLen] + t.distCost[bestDist];
-      for (let k = i + 1; k < i + bestLen && k + 2 < n; k++) head[hashAt(k)] = k;
+      for (let k = i + 1; k < i + bestLen && k + 2 < n; k++) head.set(hashAt(k), k);
       i += bestLen;
     } else {
       if (i >= rowStart) cost += t.litCost[buf[i]];
@@ -1256,6 +1299,27 @@ function lzFilteredStream(form: Form, width: number, height: number, t: { litCos
   return out;
 }
 
+
+/** The first optimal plan's bit count for a stream from a precomputed parse:
+ *  exactly the figure deflateBest's iteration 0 would compute, without
+ *  running the remaining iterations or the encoder. */
+function firstPlanBits(data: Uint8Array, pre: { ms: MatchSet; parse: Parse }): number {
+  const freq = parseFreqs(pre.parse);
+  const litLen = huffmanLengths(freq.lit, 15);
+  const distLen = huffmanLengths(freq.dist, 15);
+  const litCost = new Float64Array(288);
+  for (let s = 0; s < 288; s++) litCost[s] = litLen[s] === 0 ? 24 : litLen[s];
+  const lenCost = new Float64Array(259);
+  for (let l = 3; l <= 258; l++) lenCost[l] = litCost[257 + LEN_CODE[l]] + LEN_COST_EXTRA[l];
+  const distCost = new Float64Array(32769);
+  for (let d = 1; d <= 32768; d++) {
+    const dl = distLen[DIST_CODE[d]];
+    distCost[d] = (dl === 0 ? 24 : dl) + DIST_COST_EXTRA[d];
+  }
+  const p = dpParse(data, pre.ms, litCost, lenCost, distCost);
+  return planBlock(p, 0, p.count).bits;
+}
+
 // ---------------------------------------------------------------- Driver
 
 const SCREEN_OPTS = { level: 6 } as const;
@@ -1263,29 +1327,50 @@ const SCREEN_OPTS = { level: 6 } as const;
 /** Squeeze one RGBA image into the smallest PNG we can make. */
 function squeeze(rgba: Uint8Array, width: number, height: number): Uint8Array {
   const forms = formsOf(rgba);
-  const screened: { form: Form; raw: Uint8Array; size: number }[] = [];
+  const screened: { form: Form; raw: Uint8Array; size: number; zraw: Uint8Array }[] = [];
   for (const form of forms) {
     const choices: (number | string)[] = form.colourType === 3 ? [0, 'minsum', 'entropy'] : [0, 1, 2, 4, 'minsum', 'entropy'];
     for (const choice of choices) {
       const raw = filteredSamples(form.samples, width, height, form.bpp, choice);
       const z = deflateRawSync(raw, SCREEN_OPTS);
-      screened.push({ form, raw, size: z.length + form.chunkBytes });
+      screened.push({ form, raw, size: z.length + form.chunkBytes, zraw: new Uint8Array(z) });
     }
   }
   screened.sort((a, b) => a.size - b.size);
   const winner = screened[0];
-  for (let i = 1; i < screened.length; i++) screened[i].raw = new Uint8Array(0);
+  for (let i = 1; i < screened.length; i++) { screened[i].raw = new Uint8Array(0); screened[i].zraw = new Uint8Array(0); }
+  // Deep-chain policy: the most promising stream of each image is searched
+  // with a long hash chain instead of the default 192 — on repetitive
+  // screenshot data the winning matches sit deep in the chains, and the
+  // shallow search loses even to plain zlib-9 there.
+  const deepCapOf = (n: number): number => (n > 3_000_000 ? 1024 : n > 1_300_000 ? 1536 : 4096);
   // Candidate streams raced through the optimal compressor; smallest wins.
-  const candidates: { form: Form; raw: Uint8Array; light: boolean }[] = [{ form: winner.form, raw: winner.raw, light: false }];
+  // The winner's match set is computed once (at a shallow cap — it only
+  // seeds cost models) and shared between the LZ-filter cost tables and the
+  // winner's own deflate pass.
+  const candidates: { form: Form; raw: Uint8Array; light: boolean; deepCap: number; pre?: { ms: MatchSet; parse: Parse }; cheapRaw: Uint8Array }[] = [];
+  let winnerPre: { ms: MatchSet; parse: Parse } | undefined;
+  let lzRaw: Uint8Array | null = null;
   if (winner.size >= 90000) {
-    const tables = costTables(greedyParse(winner.raw, findMatches(winner.raw)));
-    candidates.push({ form: winner.form, raw: lzFilteredStream(winner.form, width, height, tables), light: true });
+    const ms = findMatches(winner.raw, 32);
+    const greedy = greedyParse(winner.raw, ms);
+    winnerPre = { ms, parse: greedy };
+    lzRaw = lzFilteredStream(winner.form, width, height, costTables(greedy));
+  }
+  candidates.push({ form: winner.form, raw: winner.raw, light: false, deepCap: lzRaw === null ? deepCapOf(winner.raw.length) : 0, pre: winnerPre, cheapRaw: winner.zraw });
+  if (lzRaw !== null) {
+    // The LZ-chosen filter stream is the deep target when it exists (it beat
+    // the screened stream on every large practice image), except on mid-size
+    // true-colour streams, where deep chains bought almost nothing.
+    const deep = winner.form.colourType === 6 || lzRaw.length <= 1_300_000;
+    candidates.push({ form: winner.form, raw: lzRaw, light: true, deepCap: deep ? 1024 : 0, cheapRaw: new Uint8Array(deflateRawSync(lzRaw, SCREEN_OPTS)) });
   }
   let bestForm: Form | null = null;
   let bestPng: Uint8Array | null = null;
   let bestTotal = Infinity;
-  for (const cand of candidates) {
-    const stream = deflateBest(cand.raw, cand.light);
+  let bestStreamBits = Infinity;
+  const finish = (cand: { form: Form }, stream: Uint8Array): void => {
+    if ((stream.length - 6) * 8 < bestStreamBits) bestStreamBits = (stream.length - 6) * 8;
     const chunks: [string, Uint8Array][] = [['IHDR', ihdrOf(width, height, cand.form.colourType)]];
     if (cand.form.plte !== null) chunks.push(['PLTE', cand.form.plte]);
     if (cand.form.trns !== null) chunks.push(['tRNS', cand.form.trns]);
@@ -1297,6 +1382,28 @@ function squeeze(rgba: Uint8Array, width: number, height: number): Uint8Array {
       bestForm = cand.form;
       bestPng = png;
     }
+  };
+  if (lzRaw !== null) {
+    // Probe the screened stream's first optimal plan from its shared parse,
+    // then release the shared match set before the favourite's own (much
+    // larger) search runs — the two match sets never coexist.
+    const winnerCand = candidates[0];
+    const probeBits = firstPlanBits(winnerCand.raw, winnerPre as { ms: MatchSet; parse: Parse });
+    winnerCand.pre = undefined;
+    winnerPre = undefined;
+    const lzCand = candidates[1];
+    finish(lzCand, deflateBest(lzCand.raw, lzCand.light, lzCand.deepCap, undefined, Infinity, lzCand.cheapRaw));
+    if (probeBits > bestStreamBits * 1.05) {
+      // The screened stream cannot catch the favourite: its cheap stream
+      // stands as its (losing) answer, exactly as deflateBest's bail-out
+      // would have returned.
+      finish(winnerCand, zlibWrap(winnerCand.cheapRaw, winnerCand.raw));
+    } else {
+      finish(winnerCand, deflateBest(winnerCand.raw, false, 0, undefined, bestStreamBits * 1.05, winnerCand.cheapRaw));
+    }
+  } else {
+    const cand = candidates[0];
+    finish(cand, deflateBest(cand.raw, cand.light, cand.deepCap, cand.pre, Infinity, cand.cheapRaw));
   }
   return bestPng as Uint8Array;
 }
